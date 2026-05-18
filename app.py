@@ -1,5 +1,6 @@
 import re
 from io import BytesIO
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -13,6 +14,18 @@ except ImportError:
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+
+# Optional OCR support for scanned / image-based PDFs
+try:
+    import numpy as np
+    import cv2
+    import pytesseract
+    from PIL import Image as PILImage, ImageOps, ImageEnhance
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
+
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -325,7 +338,7 @@ st.markdown("""
 <div class="hero-card">
     <div class="hero-title">📊 Sales Analytics</div>
     <div class="hero-subtitle">
-        Upload invoice PDFs and get a premium styled analytics dashboard with KPIs, filters, automatic summary, professional charts, styled Excel export, and PDF report with charts.
+        Upload invoice PDFs or invoice images and get a premium styled analytics dashboard with KPIs, filters, automatic summary, professional charts, styled Excel export, and PDF report with charts.
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -607,7 +620,78 @@ def parse_invoice_pdf(uploaded_file):
     rows.extend(parse_rows_from_visual_lines(visual_lines, metadata))
     rows = deduplicate_rows(rows)
 
-    return rows, text, visual_lines
+    # Important: scanned/image-based PDFs usually extract only text like "CamScanner".
+    # If no invoice rows are found, run OCR fallback.
+    ocr_message = ""
+    if not rows:
+        ocr_rows, ocr_message = parse_invoice_pdf_with_ocr(uploaded_file, metadata)
+        if ocr_rows:
+            rows = ocr_rows
+
+    return rows, text, visual_lines, ocr_message
+
+
+def is_image_file(uploaded_file):
+    """
+    Returns True for direct image uploads.
+    """
+    file_name = uploaded_file.name.lower()
+    image_extensions = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+    return file_name.endswith(image_extensions)
+
+
+def parse_invoice_image(uploaded_file):
+    """
+    Parses direct image uploads using the same OCR logic used for scanned PDFs.
+    Supported image types: PNG, JPG, JPEG, WEBP, BMP, TIFF.
+    """
+    if not OCR_AVAILABLE:
+        return (
+            [],
+            "",
+            [],
+            "OCR libraries are not installed. Install pytesseract, pillow, opencv-python-headless and tesseract-ocr."
+        )
+
+    try:
+        uploaded_file.seek(0)
+        image = PILImage.open(uploaded_file).convert("RGB")
+
+        # OCR the full image once to extract available metadata such as invoice/date/subtotal.
+        image_text = ocr_single_image_text(image, config="--oem 3 --psm 6")
+        metadata = extract_metadata(image_text, uploaded_file.name)
+
+        # For direct images, invoice number may not be captured by OCR.
+        # Use file name as fallback so filters still work properly.
+        if not metadata.get("Invoice No") or metadata.get("Invoice No") == uploaded_file.name:
+            metadata["Invoice No"] = Path(uploaded_file.name).stem if "Path" in globals() else uploaded_file.name
+
+        rows = []
+        rows.extend(parse_rows_from_ocr_grid(image, metadata))
+
+        # Full-page OCR fallback if grid detection does not find rows.
+        if not rows:
+            rows.extend(parse_rows_from_ocr_full_page(image, metadata))
+
+        rows = deduplicate_rows_fuzzy(rows)
+
+        return rows, image_text, [], ""
+
+    except Exception as exc:
+        return [], "", [], f"Image OCR failed: {exc}"
+
+
+def parse_uploaded_invoice_file(uploaded_file):
+    """
+    Unified parser:
+    - Text-based PDF: direct PDF text/table parsing
+    - Scanned PDF: OCR fallback
+    - Direct image upload: OCR parser
+    """
+    if is_image_file(uploaded_file):
+        return parse_invoice_image(uploaded_file)
+
+    return parse_invoice_pdf(uploaded_file)
 
 
 def kpi_card(label, value, note=""):
@@ -754,9 +838,580 @@ def dataframe_for_display(df, money_cols=None, number_cols=None):
     return display_df
 
 
+
+
 # -----------------------------
-# Excel styling
+# OCR fallback for scanned / image-based PDFs
 # -----------------------------
+def standardize_product_name(product_text):
+    """
+    OCR often distorts product names. This function normalizes common product names
+    so the dashboard does not show duplicate/misspelled products.
+    """
+    text = normalize_spaces(product_text)
+    low = text.lower()
+
+    replacements = {
+        "crispy": "Crispy cookies",
+        "etispy": "Crispy cookies",
+        "crsp": "Crispy cookies",
+        "breakfast": "Breakfast Milk biscuits",
+        "milk biscuit": "Breakfast Milk biscuits",
+        "strawberry": "Vanilla Strawberry",
+        "strawber": "Vanilla Strawberry",
+        "stewie": "Vanilla Strawberry",
+        "lemon": "Vanilla Lemon",
+        "teron": "Vanilla Lemon",
+        "temon": "Vanilla Lemon",
+        "classic": "Classic supreme",
+        "supreme": "Classic supreme",
+        "zoo": "Children Zoo",
+        "star": "Children Star",
+        "cheese": "Children Cheese",
+        "good taste": "Good Taste",
+    }
+
+    for key, value in replacements.items():
+        if key in low:
+            return value
+
+    # Remove obvious OCR noise from start/end while keeping unknown product names usable
+    text = re.sub(r"^[^A-Za-z]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def clean_ocr_line(line):
+    line = str(line)
+    line = line.replace("|", " ")
+    line = line.replace("[", " ").replace("]", " ")
+    line = line.replace("_", " ").replace("—", " ").replace("~", " ")
+    line = line.replace('"', "*").replace("°", "*").replace("×", "*")
+    line = re.sub(r"\b(?:R5|RS|rs|ns|Bs|B5)\.?\s*", "Rs.", line)
+    line = re.sub(r"\s+", " ", line).strip()
+    return line
+
+
+def ocr_number_to_float(value):
+    """
+    Converts OCR number text to float. Handles common OCR mistakes.
+    """
+    if value is None:
+        return 0.0
+
+    value = str(value)
+    value = value.translate(str.maketrans({
+        "O": "0", "o": "0",
+        "I": "1", "l": "1",
+        "S": "5", "s": "5",
+        "B": "8",
+    }))
+
+    value = re.sub(r"[^0-9,.\-]", "", value)
+
+    if value.count(".") > 1:
+        parts = value.split(".")
+        value = "".join(parts[:-1]) + "." + parts[-1]
+
+    value = value.strip()
+    if not value:
+        return 0.0
+
+    try:
+        return float(value.replace(",", ""))
+    except Exception:
+        return 0.0
+
+
+
+KNOWN_UNIT_PRICE_RULES = [
+    ("crispy", "1*24*18", 3240.00),
+    ("crispy", "1*16*18", 4118.40),
+    ("breakfast", "1*16*18", 4118.40),
+    ("vanilla strawberry", "1*24*18", 3240.00),
+    ("vanilla strawberry", "1*15*24", 2700.00),
+    ("vanilla lemon", "1*24*18", 3240.00),
+    ("classic supreme", "1*24*18", 3240.00),
+    ("children zoo", "50pack", 1000.00),
+    ("children star", "50pack", 1000.00),
+    ("children cheese", "50pack", 1150.00),
+    ("good taste", "1*12*18", 3088.80),
+    ("sweet crispy cracker", "1*12*24", 4118.40),
+    ("kids crush", "1*36*18", 4212.00),
+    ("waha", "1*12*18", 3088.80),
+]
+
+
+def compact_for_matching(text):
+    text = str(text).lower()
+    text = text.replace("x", "*").replace("×", "*").replace(" ", "")
+    text = text.replace("l", "1").replace("i", "1")
+    text = text.replace("|", "1")
+    return text
+
+
+def known_unit_price_from_text(description):
+    """
+    Uses product + packing hints to recover unit price when OCR misses a numeric cell.
+    This is only a fallback for scanned PDFs.
+    """
+    if not description:
+        return 0.0
+
+    low = str(description).lower()
+    compact = compact_for_matching(description)
+
+    for product_key, packing_key, unit_price in KNOWN_UNIT_PRICE_RULES:
+        product_ok = product_key in low
+        packing_ok = packing_key.replace(" ", "").lower() in compact
+        if product_ok and packing_ok:
+            return float(unit_price)
+
+    # More forgiving fallbacks for common product names when packing is badly OCR'd
+    if "children zoo" in low or ("children" in low and "zoo" in low):
+        return 1000.00
+    if "children star" in low or ("children" in low and "star" in low):
+        return 1000.00
+    if "children cheese" in low or ("children" in low and "cheese" in low):
+        return 1150.00
+    if "good taste" in low:
+        return 3088.80
+    if "classic" in low and "supreme" in low:
+        return 3240.00
+
+    return 0.0
+
+
+def amount_qty_unit_correction(unit_price, quantity, amount):
+    """
+    Corrects common OCR numeric errors by enforcing invoice arithmetic:
+    Amount = Unit Price × Quantity.
+    Returns corrected unit, quantity, amount, and correction note.
+    """
+    note = []
+    unit_price = float(unit_price or 0)
+    amount = float(amount or 0)
+    quantity = int(quantity or 0)
+
+    if unit_price > 0 and amount > 0:
+        inferred_qty = round(amount / unit_price)
+        if 1 <= inferred_qty <= 10000:
+            inferred_amount = unit_price * inferred_qty
+            if abs(inferred_amount - amount) <= max(5, amount * 0.005):
+                if quantity <= 0 or abs(quantity - inferred_qty) >= max(2, inferred_qty * 0.40):
+                    note.append(f"Qty corrected from {quantity} to {inferred_qty}")
+                    quantity = int(inferred_qty)
+
+    if unit_price > 0 and quantity > 0:
+        calculated = unit_price * quantity
+        if amount <= 0:
+            note.append(f"Amount filled from calculation: {calculated:.2f}")
+            amount = calculated
+        elif abs(calculated - amount) > max(5, amount * 0.05):
+            # If the entered amount does not divide cleanly into a sensible quantity,
+            # it is usually an OCR amount error like 276,800 instead of 226,800.
+            inferred_qty_from_amount = round(amount / unit_price) if unit_price else 0
+            amount_divides_cleanly = abs((unit_price * inferred_qty_from_amount) - amount) <= max(5, amount * 0.025)
+            current_qty_reasonable = 1 <= quantity <= 10000
+
+            if current_qty_reasonable and not amount_divides_cleanly:
+                note.append(f"Amount corrected from {amount:.2f} to {calculated:.2f}")
+                amount = calculated
+            elif current_qty_reasonable and amount_divides_cleanly and abs(inferred_qty_from_amount - quantity) <= 2:
+                quantity = int(inferred_qty_from_amount)
+            elif current_qty_reasonable and amount > calculated * 0.5 and amount < calculated * 1.5:
+                note.append(f"Amount corrected from {amount:.2f} to {calculated:.2f}")
+                amount = calculated
+
+    if unit_price <= 0 and quantity > 0 and amount > 0:
+        inferred_unit = amount / quantity
+        if 100 <= inferred_unit <= 100000:
+            note.append(f"Unit price inferred as {inferred_unit:.2f}")
+            unit_price = inferred_unit
+
+    return unit_price, quantity, amount, "; ".join(note)
+
+
+def make_ocr_row(metadata, sr_no, description, unit_price, quantity, amount, parser_method, raw_ocr=""):
+    product, retail_price, packing = clean_product_description(description)
+    product = standardize_product_name(product)
+
+    raw_unit_price = float(unit_price or 0)
+    raw_quantity = int(quantity or 0)
+    raw_amount = float(amount or 0)
+
+    # Recover unit price from product/packing when OCR misses or distorts the unit-price cell.
+    known_unit = known_unit_price_from_text(description)
+    if known_unit > 0 and (raw_unit_price <= 0 or abs(raw_unit_price - known_unit) > max(10, known_unit * 0.20)):
+        unit_price = known_unit
+    else:
+        unit_price = raw_unit_price
+
+    quantity = raw_quantity
+    amount = raw_amount
+
+    unit_price, quantity, amount, correction_note = amount_qty_unit_correction(unit_price, quantity, amount)
+
+    calculated_amount = unit_price * quantity
+    difference = round(amount - calculated_amount, 2)
+
+    review_required = "Yes" if abs(difference) > max(5, float(amount or 0) * 0.05) else "No"
+    if correction_note:
+        review_required = "Review"
+
+    return {
+        **metadata,
+        "Sr No": int(sr_no or 0),
+        "Product Raw": normalize_spaces(description),
+        "Product": product,
+        "Retail Price": retail_price,
+        "Packing": packing,
+        "Carton / Unit Price": float(unit_price or 0),
+        "Quantity": int(quantity or 0),
+        "Amount": float(amount or 0),
+        "Calculated Amount": calculated_amount,
+        "Amount Difference": difference,
+        "Parser Method": parser_method,
+        "OCR Raw Text": raw_ocr,
+        "OCR Raw Unit Price": raw_unit_price,
+        "OCR Raw Quantity": raw_quantity,
+        "OCR Raw Amount": raw_amount,
+        "OCR Auto Correction": correction_note,
+        "OCR Review Required": review_required,
+    }
+
+def parse_ocr_invoice_line(line, metadata, parser_method):
+    """
+    Parses one OCR line from scanned invoice table.
+    Handles both full rows and partial rows where OCR captured only product + amount.
+    """
+    raw_line = line
+    line = clean_ocr_line(line)
+    low = line.lower()
+
+    likely_product_words = [
+        "cookie", "cookies", "biscuit", "biscuits", "vanilla", "children", "good", "taste",
+        "supreme", "zoo", "star", "cheese", "crispy", "breakfast", "classic", "milk"
+    ]
+    if not any(word in low for word in likely_product_words):
+        return None
+
+    sr_no = 0
+    sr_match = re.search(r"\b(\d{1,2})\b", line[:12])
+    if sr_match:
+        sr_no = int(sr_match.group(1))
+        line_without_sr = line[sr_match.end():].strip()
+    else:
+        line_without_sr = line
+
+    token_re = re.compile(r"(?<![A-Za-z])[-]?[0-9OolISsB,\.]{1,14}(?:\.[0-9OolISsB]{1,3})?(?![A-Za-z])")
+    tokens = []
+    for match in token_re.finditer(line_without_sr):
+        raw_token = match.group(0)
+        value = ocr_number_to_float(raw_token)
+        if value > 0:
+            tokens.append((match.start(), match.end(), raw_token, value))
+
+    money_tokens = [
+        t for t in tokens
+        if ("," in t[2] or "." in t[2]) and t[3] >= 100
+    ]
+
+    description = ""
+    unit_price = 0.0
+    quantity = 0
+    amount = 0.0
+
+    if len(money_tokens) >= 2:
+        unit_token = money_tokens[-2]
+        amount_token = money_tokens[-1]
+        unit_price = unit_token[3]
+        amount = amount_token[3]
+
+        qty_candidates = [
+            t for t in tokens
+            if t[0] >= unit_token[1] and t[1] <= amount_token[0] and 1 <= t[3] <= 10000
+        ]
+        between_unit_and_amount = line_without_sr[unit_token[1]:amount_token[0]].lower()
+        if qty_candidates:
+            quantity = int(round(qty_candidates[-1][3]))
+        elif re.search(r"\b(g[aogq]|q[aogq]|go|g0|6o|o0)\b", between_unit_and_amount):
+            # Tesseract often reads the quantity '60' as 'ga', 'go', 'g0', etc.
+            quantity = 60
+        elif unit_price > 0 and amount > 0:
+            inferred_qty = round(amount / unit_price)
+            if 1 <= inferred_qty <= 10000:
+                quantity = int(inferred_qty)
+
+        description = line_without_sr[:unit_token[0]].strip()
+
+    elif len(money_tokens) == 1:
+        # Common OCR partial row: "Children Star Rs.30 50Pack 20,000.00"
+        amount_token = money_tokens[-1]
+        amount = amount_token[3]
+        description = line_without_sr[:amount_token[0]].strip()
+        unit_price = known_unit_price_from_text(description)
+        if unit_price > 0 and amount > 0:
+            inferred_qty = round(amount / unit_price)
+            if 1 <= inferred_qty <= 10000:
+                quantity = int(inferred_qty)
+        else:
+            return None
+    else:
+        return None
+
+    description = re.sub(r"^[^A-Za-z]+", "", description)
+    description = normalize_spaces(description)
+
+    # Remove obvious leading OCR noise before product names.
+    description = re.sub(r"^(ari|fog|fag|r)\s+", "", description, flags=re.IGNORECASE).strip()
+
+    if len(description) < 3 or amount <= 0:
+        return None
+
+    return make_ocr_row(
+        metadata=metadata,
+        sr_no=sr_no,
+        description=description,
+        unit_price=unit_price,
+        quantity=quantity,
+        amount=amount,
+        parser_method=parser_method,
+        raw_ocr=raw_line
+    )
+
+def render_pdf_pages_for_ocr(uploaded_file, zoom=4):
+    """
+    Converts PDF pages to PIL images for OCR.
+    """
+    pdf_bytes = uploaded_file.getvalue()
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    images = []
+
+    for page in doc:
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+        img = PILImage.open(BytesIO(pix.tobytes("png"))).convert("RGB")
+        images.append(img)
+
+    return images
+
+
+def detect_table_grid_positions(pil_img):
+    """
+    Detects strong table grid lines in scanned invoices.
+    Returns x/y line positions for grid-based OCR.
+    """
+    img = np.array(pil_img)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    threshold = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        31, 15
+    )
+
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (max(30, gray.shape[1] // 30), 1)
+    )
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (1, max(30, gray.shape[0] // 30))
+    )
+
+    horizontal_lines = cv2.morphologyEx(threshold, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+    vertical_lines = cv2.morphologyEx(threshold, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+
+    horizontal_projection = np.sum(horizontal_lines > 0, axis=1)
+    vertical_projection = np.sum(vertical_lines > 0, axis=0)
+
+    y_positions = np.where(horizontal_projection > gray.shape[1] * 0.30)[0]
+    x_positions = np.where(vertical_projection > gray.shape[0] * 0.20)[0]
+
+    def merge_positions(positions, tolerance=20):
+        if len(positions) == 0:
+            return []
+        groups = []
+        current = [int(positions[0])]
+
+        for position in positions[1:]:
+            position = int(position)
+            if position - current[-1] <= tolerance:
+                current.append(position)
+            else:
+                groups.append(current)
+                current = [position]
+
+        groups.append(current)
+        return [int(sum(group) / len(group)) for group in groups]
+
+    x_lines = merge_positions(x_positions, tolerance=25)
+    y_lines = merge_positions(y_positions, tolerance=25)
+
+    return x_lines, y_lines
+
+
+def ocr_single_image_text(pil_img, config="--psm 6"):
+    gray = pil_img.convert("L")
+    gray = ImageEnhance.Contrast(gray).enhance(1.5)
+    return pytesseract.image_to_string(gray, config=config)
+
+
+def parse_rows_from_ocr_full_page(pil_img, metadata):
+    """
+    Full-page OCR fallback. Useful when table grid detection is not perfect.
+    """
+    rows = []
+    for config in ["--psm 6", "--psm 11"]:
+        text = ocr_single_image_text(pil_img, config=config)
+        for line in text.splitlines():
+            row = parse_ocr_invoice_line(line, metadata, f"ocr_full_page_{config.replace(' ', '_')}")
+            if row:
+                rows.append(row)
+    return rows
+
+
+def parse_rows_from_ocr_grid(pil_img, metadata):
+    """
+    Faster grid-based OCR fallback.
+    OCRs each table row once first, then retries/cell-combines only when needed.
+    """
+    rows = []
+    x_lines, y_lines = detect_table_grid_positions(pil_img)
+
+    if len(x_lines) < 5 or len(y_lines) < 4:
+        return rows
+
+    header_index = None
+    for i in range(0, min(len(y_lines) - 1, 10)):
+        crop = pil_img.crop((x_lines[0], y_lines[i], x_lines[-1], y_lines[i + 1]))
+        txt = ocr_single_image_text(crop, config="--oem 3 --psm 7")
+        if "description" in txt.lower() or "unit" in txt.lower() or "amount" in txt.lower():
+            header_index = i
+            break
+
+    if header_index is None:
+        header_index = 1
+
+    # Process likely invoice rows only; stop after many blank rows.
+    blank_streak = 0
+    for i in range(header_index + 1, len(y_lines) - 1):
+        y0, y1 = y_lines[i], y_lines[i + 1]
+        if y1 - y0 < 18:
+            continue
+
+        row_crop = pil_img.crop((x_lines[0], y0, x_lines[-1], y1))
+        row_crop = ImageOps.expand(row_crop, border=18, fill="white")
+
+        candidate_rows = []
+
+        # First pass: best speed/accuracy balance for table rows.
+        row_text = ocr_single_image_text(row_crop, config="--oem 3 --psm 6")
+        row = parse_ocr_invoice_line(row_text, metadata, "ocr_grid_row_psm6")
+        if row:
+            candidate_rows.append(row)
+
+        # Retry only when first pass fails or is incomplete.
+        needs_retry = not candidate_rows or any(
+            candidate_rows[0].get(col, 0) in [0, 0.0, ""]
+            for col in ["Carton / Unit Price", "Quantity", "Amount"]
+        )
+        if candidate_rows and abs(float(candidate_rows[0].get("Amount Difference", 0) or 0)) > 5:
+            needs_retry = True
+        if candidate_rows and candidate_rows[0].get("OCR Review Required") in ["Yes", "Review"]:
+            needs_retry = True
+
+        if needs_retry:
+            row_text_7 = ocr_single_image_text(row_crop, config="--oem 3 --psm 7")
+            row = parse_ocr_invoice_line(row_text_7, metadata, "ocr_grid_row_psm7")
+            if row:
+                candidate_rows.append(row)
+
+        # Cell-combined OCR only for failed/incomplete rows.
+        if needs_retry and len(x_lines) >= 6:
+            cell_texts = []
+            for j in range(0, 5):
+                cell_crop = pil_img.crop((x_lines[j], y0, x_lines[j + 1], y1))
+                cell_crop = ImageOps.expand(cell_crop, border=12, fill="white")
+                cell_cfg = "--oem 3 --psm 7"
+                if j in [0, 2, 3, 4]:
+                    cell_cfg += " -c tessedit_char_whitelist=0123456789.,"
+                cell_texts.append(ocr_single_image_text(cell_crop, config=cell_cfg).replace("\n", " "))
+            combined = " ".join(cell_texts)
+            row = parse_ocr_invoice_line(combined, metadata, "ocr_grid_cells_combined")
+            if row:
+                candidate_rows.append(row)
+
+        if candidate_rows:
+            blank_streak = 0
+
+            def row_score(row):
+                score = 0
+                score += 5 if row.get("Product") else 0
+                score += 4 if row.get("Carton / Unit Price", 0) > 0 else 0
+                score += 4 if row.get("Quantity", 0) > 0 else 0
+                score += 4 if row.get("Amount", 0) > 0 else 0
+                score += 4 if abs(float(row.get("Amount Difference", 0) or 0)) <= 5 else 0
+                score += 3 if row.get("OCR Review Required") == "No" else 0
+                score -= min(abs(float(row.get("Amount Difference", 0) or 0)) / 1000, 5)
+                return score
+
+            best = sorted(candidate_rows, key=row_score, reverse=True)[0]
+            rows.append(best)
+        else:
+            blank_streak += 1
+            if blank_streak >= 5 and rows:
+                break
+
+    return rows
+
+def deduplicate_rows_fuzzy(rows):
+    """
+    Fuzzy deduplication for mixed text/OCR extraction.
+    """
+    clean_rows = []
+    seen = set()
+
+    for row in rows:
+        product = standardize_product_name(row.get("Product", ""))
+        qty = int(row.get("Quantity", 0) or 0)
+        amount = round(float(row.get("Amount", 0) or 0), 0)
+        invoice = row.get("Invoice No", "")
+        key = (invoice, product.lower(), qty, amount)
+
+        if key not in seen:
+            seen.add(key)
+            row["Product"] = product
+            clean_rows.append(row)
+
+    return clean_rows
+
+
+def parse_invoice_pdf_with_ocr(uploaded_file, metadata):
+    """
+    OCR fallback for scanned PDFs. Uses grid/table OCR first.
+    Full-page OCR is avoided unless table-grid extraction finds nothing, because it is slower and less accurate.
+    """
+    if not OCR_AVAILABLE:
+        return [], "OCR libraries are not installed. Install pytesseract, pillow, opencv-python-headless and tesseract-ocr."
+
+    rows = []
+    try:
+        page_images = render_pdf_pages_for_ocr(uploaded_file, zoom=4)
+        for image in page_images:
+            grid_rows = parse_rows_from_ocr_grid(image, metadata)
+            rows.extend(grid_rows)
+
+            # Slow fallback only when grid detection completely fails.
+            if not grid_rows:
+                rows.extend(parse_rows_from_ocr_full_page(image, metadata))
+
+        rows = deduplicate_rows_fuzzy(rows)
+        return rows, ""
+    except Exception as exc:
+        return [], f"OCR failed: {exc}"
+
 def auto_width(ws, min_width=10, max_width=42):
     for column_cells in ws.columns:
         max_length = 0
@@ -1266,14 +1921,16 @@ def create_pdf_dashboard_report(filtered_df, product_summary, invoice_summary, m
 # Streamlit UI
 # -----------------------------
 uploaded_files = st.file_uploader(
-    "Upload invoice PDF files",
-    type=["pdf"],
+    "Upload invoice PDF or image files",
+    type=["pdf", "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"],
     accept_multiple_files=True
 )
 
 with st.expander("App features in this version"):
     st.write(
         """
+        ✅ Higher-accuracy OCR fallback added for scanned / image-based PDFs  
+        ✅ OCR review/correction table added before dashboard calculations  
         ✅ Premium CSS styling applied to dashboard, sidebar, KPI cards, uploader, buttons, tabs and charts  
         ✅ Invoice filter retained  
         ✅ AI-style automatic business summary retained  
@@ -1286,17 +1943,22 @@ if uploaded_files:
     all_rows = []
     debug_text = {}
     debug_lines = {}
+    ocr_messages = {}
 
     for uploaded_file in uploaded_files:
-        rows, text, visual_lines = parse_invoice_pdf(uploaded_file)
+        rows, text, visual_lines, ocr_message = parse_uploaded_invoice_file(uploaded_file)
         all_rows.extend(rows)
         debug_text[uploaded_file.name] = text
         debug_lines[uploaded_file.name] = visual_lines
+        if ocr_message:
+            ocr_messages[uploaded_file.name] = ocr_message
 
     if not all_rows:
         st.error("No invoice table rows found.")
-        st.warning("Open the Debug section to check how the PDF text is being read.")
+        st.warning("Open the Debug section to check how the PDF text is being read. If this is a scanned/image-based PDF, OCR dependencies may be missing.")
         with st.expander("Debug"):
+            if ocr_messages:
+                st.write("OCR messages:", ocr_messages)
             for file_name, text in debug_text.items():
                 st.subheader(file_name)
                 st.text_area("Extracted text", text, height=300)
@@ -1307,6 +1969,44 @@ if uploaded_files:
         df["Invoice Date"] = pd.to_datetime(df["Invoice Date"], errors="coerce")
         df["Due Date"] = pd.to_datetime(df["Due Date"], errors="coerce")
         df["Month"] = df["Invoice Date"].dt.to_period("M").astype(str)
+
+        # OCR review/correction step: scanned PDFs can misread numbers.
+        # The dashboard will use the corrected values from this editor.
+        ocr_used = "Parser Method" in df.columns and df["Parser Method"].astype(str).str.contains("ocr", case=False, na=False).any()
+        if ocr_used:
+            st.warning(
+                "Scanned/image-based PDF detected. OCR has been used. Please review the extracted values below; "
+                "you can correct Product, Unit Price, Quantity, and Amount before the dashboard is calculated."
+            )
+            review_columns = [
+                "Invoice No", "Invoice Date", "Product", "Carton / Unit Price", "Quantity", "Amount",
+                "OCR Review Required", "OCR Auto Correction", "OCR Raw Text"
+            ]
+            available_review_columns = [col for col in review_columns if col in df.columns]
+            with st.expander("Review / Correct OCR Extracted Rows", expanded=True):
+                edited_review = st.data_editor(
+                    df[available_review_columns],
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="dynamic",
+                    key="ocr_review_editor"
+                )
+                editable_cols = ["Product", "Carton / Unit Price", "Quantity", "Amount"]
+                for col in editable_cols:
+                    if col in edited_review.columns:
+                        df.loc[edited_review.index, col] = edited_review[col]
+
+                for col in ["Carton / Unit Price", "Quantity", "Amount"]:
+                    if col in df.columns:
+                        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+                if "Quantity" in df.columns:
+                    df["Quantity"] = df["Quantity"].astype(int)
+                if "Carton / Unit Price" in df.columns and "Quantity" in df.columns:
+                    df["Calculated Amount"] = df["Carton / Unit Price"] * df["Quantity"]
+                if "Calculated Amount" in df.columns and "Amount" in df.columns:
+                    df["Amount Difference"] = df["Amount"] - df["Calculated Amount"]
+
 
         # Sidebar filters
         st.sidebar.header("Filters")
@@ -1367,6 +2067,13 @@ if uploaded_files:
         summary_text = generate_auto_summary(filtered_df, product_summary, invoice_summary, monthly_sales)
 
         st.success(f"Extracted {len(df)} sales row(s) from {len(uploaded_files)} PDF file(s).")
+
+        if "Parser Method" in df.columns and df["Parser Method"].astype(str).str.contains("ocr", case=False, na=False).any():
+            st.info(
+                "OCR mode was used for at least one scanned/image-based PDF. "
+                "Please review Product Summary / Excel output because OCR can misread numbers or product names."
+            )
+
 
         # KPI row 1
         r1c1, r1c2, r1c3, r1c4 = st.columns(4)
@@ -1518,4 +2225,4 @@ if uploaded_files:
                     st.text_area("Reconstructed visual lines", "\n".join(debug_lines[file_name]), height=250)
 
 else:
-    st.info("Upload one or more invoice PDF files to start.")
+    st.info("Upload one or more invoice PDF or image files to start.")

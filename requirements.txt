@@ -5,3 +5,7 @@ plotly
 openpyxl
 reportlab
 matplotlib
+pillow
+pytesseract
+opencv-python-headless
+numpy
